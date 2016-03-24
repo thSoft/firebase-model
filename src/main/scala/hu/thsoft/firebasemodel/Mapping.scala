@@ -89,7 +89,7 @@ object Mapping {
 
   lazy val string: Mapping[String] =
     reader(readJs[String])
-  
+
   lazy val int: Mapping[Int] =
     reader(readJs[Int])
 
@@ -150,11 +150,11 @@ object Mapping {
             elementMapping.observe(child).map((child.toString, _))
           })
           val elementsByChild = Observable.merge(updatesByChild:_*).scan(Map[String, T]())(_ + _)
-          elementsByChild.map(_.values.toList)
+          elementsByChild.map(_.toList.sortBy(_._1).map(_._2))
         })
       }
     }
-  
+
   private def getChildren(snapshot: FirebaseDataSnapshot): List[Firebase] = {
     val children = ListBuffer[Firebase]()
     snapshot.forEach((child: FirebaseDataSnapshot) => {
