@@ -17,15 +17,22 @@ import upickle.default.readJs
 import monifu.reactive.Subscriber
 import scalaz.Applicative
 import scalaz.syntax.ApplyOps
+import scala.collection.mutable.ListBuffer
+
+// TODO trace
+// TODO error handling
+// TODO write
 
 trait Mapping[+T] {
   def observe(firebase: Firebase): Observable[T]
 }
 
+case class Cancellation(cancellation: js.Any) extends Throwable
+
 object Mapping {
 
-  def always[A](value: A): Mapping[A] =
-    new Mapping[A] {
+  def always[T](value: T): Mapping[T] =
+    new Mapping[T] {
       def observe(firebase: Firebase) = {
         Observable(value)
       }
@@ -65,8 +72,6 @@ object Mapping {
         }.refCount
       }
     }
-
-  case class Cancellation(cancellation: js.Any) extends Throwable
 
   def map[A, B](mapping: Mapping[A])(transform: A => B): Mapping[B] =
     new Mapping[B] {
@@ -115,7 +120,7 @@ object Mapping {
       }
   }
 
-  /** Use ApplicativeBuilder to create a record mapping from field mappings. */
+  /** Use scalaz's ApplicativeBuilder to create a record mapping from field mappings. */
   def field[T](key: String, mapping: Mapping[T]): Mapping[T] =
     new Mapping[T] {
       def observe(firebase: Firebase) = {
@@ -134,5 +139,29 @@ object Mapping {
         })
       }
     }
+
+  def list[T](elementMapping: Mapping[T]): Mapping[List[T]] =
+    new Mapping[List[T]] {
+      def observe(firebase: Firebase) = {
+        val listObservable = raw.observe(firebase)
+        listObservable.switchMap(snapshot => {
+          val children = getChildren(snapshot)
+          val updatesByChild = children.map((child: Firebase) => {
+            elementMapping.observe(child).map((child.toString, _))
+          })
+          val elementsByChild = Observable.merge(updatesByChild:_*).scan(Map[String, T]())(_ + _)
+          elementsByChild.map(_.values.toList)
+        })
+      }
+    }
+  
+  private def getChildren(snapshot: FirebaseDataSnapshot): List[Firebase] = {
+    val children = ListBuffer[Firebase]()
+    snapshot.forEach((child: FirebaseDataSnapshot) => {
+      children += child.ref()
+      false
+    })
+    children.toList
+  }
 
 }
