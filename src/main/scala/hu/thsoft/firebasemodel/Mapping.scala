@@ -15,41 +15,50 @@ import upickle.Js
 import upickle.default.StringRW
 import upickle.default.readJs
 import monifu.reactive.Subscriber
-import scalaz.Applicative
-import scalaz.syntax.ApplyOps
 import scala.collection.mutable.ListBuffer
 
-// TODO trace
 // TODO error handling
 // TODO write
 
 trait Mapping[+T] {
-  def observe(firebase: Firebase): Observable[T]
+  def observe(firebase: Firebase): Observable[Remote[T]]
 }
+
+case class Remote[+T](
+  firebase: Firebase,
+  value: T
+)
 
 case class Cancellation(cancellation: js.Any) extends Throwable
 
+case class Field[T](
+  key: String,
+  mapping: Mapping[T]
+)
+
 object Mapping {
+
+  type Stored[+T] = Remote[T]
 
   def always[T](value: T): Mapping[T] =
     new Mapping[T] {
       def observe(firebase: Firebase) = {
-        Observable(value)
+        Observable(Remote(firebase, value))
       }
     }
 
   def raw: Mapping[FirebaseDataSnapshot] =
     new Mapping[FirebaseDataSnapshot] {
       def observe(firebase: Firebase) = {
-        new ConnectableObservable[FirebaseDataSnapshot] {
+        new ConnectableObservable[Remote[FirebaseDataSnapshot]] {
 
-          private val channel = PublishChannel[FirebaseDataSnapshot](OverflowStrategy.Unbounded)(monifu.concurrent.Implicits.globalScheduler)
+          private val channel = PublishChannel[Remote[FirebaseDataSnapshot]](OverflowStrategy.Unbounded)(monifu.concurrent.Implicits.globalScheduler)
 
           private lazy val subscription = {
             val eventType = "value"
             val callback =
               (snapshot: FirebaseDataSnapshot, previousKey: js.UndefOr[String]) => {
-                channel.pushNext(snapshot)
+                channel.pushNext(Remote(firebase, snapshot))
                 ()
               }
             val cancelCallback =
@@ -65,7 +74,7 @@ object Mapping {
 
           override def connect() = subscription
 
-          override def onSubscribe(subscriber: Subscriber[FirebaseDataSnapshot]): Unit = {
+          override def onSubscribe(subscriber: Subscriber[Remote[FirebaseDataSnapshot]]): Unit = {
             channel.onSubscribe(subscriber)
           }
 
@@ -76,7 +85,9 @@ object Mapping {
   def map[A, B](mapping: Mapping[A])(transform: A => B): Mapping[B] =
     new Mapping[B] {
       def observe(firebase: Firebase) = {
-        mapping.observe(firebase).map(transform)
+        mapping.observe(firebase).map(remote =>
+          Remote(remote.firebase, transform(remote.value))
+        )
       }
     }
 
@@ -103,28 +114,61 @@ object Mapping {
     new Mapping[T] {
       def observe(firebase: Firebase) = {
         val urlObservable = string.observe(firebase)
-        urlObservable.switchMap(url => {
-          mapping.observe(new Firebase(url))
-        })
+        urlObservable.switchMap(remoteUrl =>
+          mapping.observe(new Firebase(remoteUrl.value))
+        )
       }
     }
 
-  implicit val applicative = new Applicative[Mapping] {
-    def point[A](a: => A) =
-      always(a)
-    def ap[A, B](as: => Mapping[A])(fs: => Mapping[(A) => B]) =
-      new Mapping[B] {
-        def observe(firebase: Firebase) = {
-          as.observe(firebase).combineLatest(fs.observe(firebase)).map { case (a, f) => f(a) }
-        }
-      }
-  }
-
-  /** Use scalaz's ApplicativeBuilder to create a record mapping from field mappings. */
-  def field[T](key: String, mapping: Mapping[T]): Mapping[T] =
+  private def field[T](field: Field[T]): Mapping[T] =
     new Mapping[T] {
       def observe(firebase: Firebase) = {
-        mapping.observe(firebase.child(key))
+        field.mapping.observe(firebase.child(field.key))
+      }
+    }
+
+  private def convertToRecord[Fields, Record](fieldsObservable: Observable[Fields], firebase: Firebase)(makeRecord: Fields => Record) =
+    fieldsObservable.map(fields => Remote(firebase, makeRecord(fields)))
+
+  def record1[Field1, Record](makeRecord: Remote[Field1] => Record)(
+    field1: Field[Field1]
+  ): Mapping[Record] =
+    new Mapping[Record] {
+      def observe(firebase: Firebase) = {
+        val field1Observable = field(field1).observe(firebase)
+        convertToRecord(field1Observable, firebase)(makeRecord)
+      }
+    }
+
+  def record2[Field1, Field2, Record](makeRecord: (Remote[Field1], Remote[Field2]) => Record)(
+    field1: Field[Field1],
+    field2: Field[Field2]
+  ): Mapping[Record] =
+    new Mapping[Record] {
+      def observe(firebase: Firebase) = {
+        val field1Observable = field(field1).observe(firebase)
+        val field2Observable = field(field2).observe(firebase)
+        val fieldsObservable = field1Observable.combineLatest(field2Observable)
+        convertToRecord(fieldsObservable, firebase)(makeRecord.tupled)
+      }
+    }
+
+  def record3[Field1, Field2, Field3, Record](makeRecord: (Remote[Field1], Remote[Field2], Remote[Field3]) => Record)(
+    field1: Field[Field1],
+    field2: Field[Field2],
+    field3: Field[Field3]
+  ): Mapping[Record] =
+    new Mapping[Record] {
+      def observe(firebase: Firebase) = {
+        val field1Observable = field(field1).observe(firebase)
+        val field2Observable = field(field2).observe(firebase)
+        val field3Observable = field(field3).observe(firebase)
+        val fieldsObservable =
+          field1Observable
+            .combineLatest(field2Observable)
+            .combineLatest(field3Observable)
+            .map { case ((f1, f2), f3) => (f1, f2, f3) }
+        convertToRecord(fieldsObservable, firebase)(makeRecord.tupled)
       }
     }
 
@@ -132,25 +176,30 @@ object Mapping {
     new Mapping[T] {
       def observe(firebase: Firebase) = {
         val typeNameObservable = string.observe(firebase.child("type"))
-        typeNameObservable.switchMap(typeName => {
-          options.toMap.get(typeName)
-            .map(_().observe(firebase.child("value")))
+        typeNameObservable.switchMap(remoteTypeName =>
+          options.toMap.get(remoteTypeName.value)
+            .map(mapping => mapping().observe(firebase.child("value")))
             .getOrElse(Observable.empty)
-        })
+        )
       }
     }
 
-  def list[T](elementMapping: Mapping[T]): Mapping[List[T]] =
-    new Mapping[List[T]] {
+  type Many[+T] =
+    List[Remote[T]]
+
+  def list[T](elementMapping: Mapping[T]): Mapping[Many[T]] =
+    new Mapping[Many[T]] {
       def observe(firebase: Firebase) = {
         val listObservable = raw.observe(firebase)
-        listObservable.switchMap(snapshot => {
-          val children = getChildren(snapshot)
-          val updatesByChild = children.map((child: Firebase) => {
-            elementMapping.observe(child).map((child.toString, _))
-          })
-          val elementsByChild = Observable.merge(updatesByChild:_*).scan(Map[String, T]())(_ + _)
-          elementsByChild.map(_.toList.sortBy(_._1).map(_._2))
+        listObservable.switchMap(remoteSnapshot => {
+          val children = getChildren(remoteSnapshot.value)
+          val updatesByChild = children.map(child =>
+            elementMapping.observe(child).map(elementValue => (child.toString, elementValue))
+          )
+          val elementsByChild = Observable.merge(updatesByChild:_*).scan(Map[String, Remote[T]]())(_ + _)
+          elementsByChild.map(elementMap =>
+            Remote(firebase, elementMap.toList.sortBy(entry => entry._1).map(entry => entry._2))
+          )
         })
       }
     }

@@ -14,8 +14,7 @@ scalaVersion := "2.11.7"
 libraryDependencies ++= Seq(
   "hu.thsoft" %%% "firebase-scalajs" % "2.4.1",
   "org.monifu" %%% "monifu" % "1.1",
-  "com.lihaoyi" %%% "upickle" % "0.3.8",
-  "org.scalaz" %%% "scalaz-core" % "7.2.1"
+  "com.lihaoyi" %%% "upickle" % "0.3.8"
 )
 
 EclipseKeys.withSource := true
