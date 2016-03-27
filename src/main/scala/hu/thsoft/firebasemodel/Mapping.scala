@@ -16,6 +16,7 @@ import upickle.default.StringRW
 import upickle.default.readJs
 import monifu.reactive.Subscriber
 import scala.collection.mutable.ListBuffer
+import scala.concurrent.Future
 
 // TODO error handling
 // TODO write
@@ -168,6 +169,28 @@ object Mapping {
             .combineLatest(field2Observable)
             .combineLatest(field3Observable)
             .map { case ((f1, f2), f3) => (f1, f2, f3) }
+        convertToRecord(fieldsObservable, firebase)(makeRecord.tupled)
+      }
+    }
+
+  def record4[Field1, Field2, Field3, Field4, Record](makeRecord: (Remote[Field1], Remote[Field2], Remote[Field3], Remote[Field4]) => Record)(
+    field1: Field[Field1],
+    field2: Field[Field2],
+    field3: Field[Field3],
+    field4: Field[Field4]
+  ): Mapping[Record] =
+    new Mapping[Record] {
+      def observe(firebase: Firebase) = {
+        val field1Observable = field(field1).observe(firebase)
+        val field2Observable = field(field2).observe(firebase)
+        val field3Observable = field(field3).observe(firebase)
+        val field4Observable = field(field4).observe(firebase)
+        val fieldsObservable =
+          field1Observable
+            .combineLatest(field2Observable)
+            .combineLatest(field3Observable)
+            .combineLatest(field4Observable)
+            .map { case (((f1, f2), f3), f4) => (f1, f2, f3, f4) }
         convertToRecord(fieldsObservable, firebase)(makeRecord.tupled)
       }
     }
