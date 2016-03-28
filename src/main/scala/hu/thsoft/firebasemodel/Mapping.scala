@@ -19,11 +19,10 @@ import scala.concurrent.Future
 import scala.scalajs.js.Thenable.Implicits.thenable2future
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.reflect.ClassTag
-
-// TODO error handling
+import Mapping.Stored
 
 trait Mapping[T] {
-  def observe(firebase: Firebase): Observable[Remote[T]]
+  def observe(firebase: Firebase): Observable[Stored[T]]
   def set(firebase: Firebase, value: T): Future[Unit]
 }
 
@@ -32,12 +31,14 @@ case class Remote[+T](
   value: T
 )
 
+case class Invalid(json: Js.Value, expectedTypeName: String, error: Throwable)
+
 case class Cancellation(cancellation: js.Any) extends Throwable
 
 case class Field[FieldValue, Record](
   key: String,
   mapping: Mapping[FieldValue],
-  get: Record => Remote[FieldValue]
+  get: Record => Stored[FieldValue]
 )
 
 case class Alternative[T](
@@ -47,7 +48,7 @@ case class Alternative[T](
 
 object Mapping {
 
-  type Stored[+T] = Remote[T]
+  type Stored[+T] = Remote[Either[Invalid, T]]
 
   def observeRaw(firebase: Firebase): Observable[FirebaseDataSnapshot] =
     new ConnectableObservable[FirebaseDataSnapshot] {
@@ -65,7 +66,11 @@ object Mapping {
           (cancellation: js.Any) => {
             channel.pushError(Cancellation(cancellation))
           }
-        firebase.on(eventType, callback, cancelCallback)
+        try {
+          firebase.on(eventType, callback, cancelCallback)
+        } catch {
+          case e: Throwable => channel.pushError(e)
+        }
         BooleanCancelable {
           channel.pushComplete()
           firebase.off(eventType, callback)
@@ -83,7 +88,7 @@ object Mapping {
   def always[T](value: T): Mapping[T] =
     new Mapping[T] {
       def observe(firebase: Firebase) = {
-        Observable(Remote(firebase, value))
+        Observable(Remote(firebase, Right(value)))
       }
       def set(firebase: Firebase, value: T) = {
         Future(())
@@ -94,7 +99,7 @@ object Mapping {
     new Mapping[B] {
       def observe(firebase: Firebase) = {
         mapping.observe(firebase).map(remote =>
-          Remote(remote.firebase, transformRead(remote.value))
+          Remote(remote.firebase, remote.value.right.map(transformRead))
         )
       }
       def set(firebase: Firebase, value: B) = {
@@ -102,13 +107,19 @@ object Mapping {
       }
     }
 
-  def atomic[T](readJson: Js.Value => T)(writeJson: T => Js.Value): Mapping[T] =
+  def atomic[T](readJson: Js.Value => T)(writeJson: T => Js.Value)(typeName: String): Mapping[T] =
     new Mapping[T] {
       def observe(firebase: Firebase) = {
         observeRaw(firebase).map(snapshot => {
           val snapshotValue = snapshot.`val`
           val json = upickle.json.readJs(snapshotValue)
-          Remote(firebase, readJson(json))
+          val value =
+            try {
+              Right(readJson(json))
+            } catch {
+              case e: Throwable => Left(Invalid(json, typeName, e))
+            }
+          Remote(firebase, value)
         })
       }
       def set(firebase: Firebase, value: T) = {
@@ -117,31 +128,37 @@ object Mapping {
     }
 
   lazy val string: Mapping[String] =
-    atomic(readJs[String])(writeJs[String])
+    atomic(readJs[String])(writeJs[String])("string")
 
   lazy val int: Mapping[Int] =
-    atomic(readJs[Int])(writeJs[Int])
+    atomic(readJs[Int])(writeJs[Int])("integer")
 
   lazy val double: Mapping[Double] =
-    atomic(readJs[Double])(writeJs[Double])
+    atomic(readJs[Double])(writeJs[Double])("double")
 
   lazy val boolean: Mapping[Boolean] =
-    atomic(readJs[Boolean])(writeJs[Boolean])
+    atomic(readJs[Boolean])(writeJs[Boolean])("boolean")
 
-  def reference[T](mapping: Mapping[T]): Mapping[Remote[T]] =
-    new Mapping[Remote[T]] {
+  def reference[T](mapping: Mapping[T]): Mapping[Stored[T]] =
+    new Mapping[Stored[T]] {
       def observe(firebase: Firebase) = {
         val urlObservable = string.observe(firebase)
         urlObservable.switchMap(remoteUrl =>
-          mapping.observe(new Firebase(remoteUrl.value)).map(value => Remote(firebase, value))
+          remoteUrl.value match {
+            case Left(error) => Observable(Remote(firebase, Left(error)))
+            case Right(url) =>
+              mapping.observe(new Firebase(url))
+                .map(value => Remote(firebase, Right(value)))
+          }
+
         )
       }
-      def set(firebase: Firebase, reference: Remote[T]) = {
+      def set(firebase: Firebase, reference: Stored[T]) = {
         string.set(firebase, reference.firebase.toString)
       }
     }
 
-  private def field[T, R](field: Field[T, R]): Mapping[T] =
+  private def fieldMapping[T, R](field: Field[T, R]): Mapping[T] =
     new Mapping[T] {
       def observe(firebase: Firebase) = {
         field.mapping.observe(firebase.child(field.key))
@@ -152,36 +169,39 @@ object Mapping {
     }
 
   private def convertToRecord[Fields, Record](fieldsObservable: Observable[Fields], firebase: Firebase)(makeRecord: Fields => Record) =
-    fieldsObservable.map(fields => Remote(firebase, makeRecord(fields)))
+    fieldsObservable.map(fields => Remote(firebase, Right(makeRecord(fields))))
 
-  def record1[Field1, Record](makeRecord: Remote[Field1] => Record)(
+  private def setField[FieldValue, Record](field: Field[FieldValue, Record], record: Record, firebase: Firebase) =
+    field.get(record).value.right.toOption.map(value => fieldMapping(field).set(firebase, value)).getOrElse(Future())
+
+  def record[Field1, Record](makeRecord: Stored[Field1] => Record)(
     field1: Field[Field1, Record]
   ): Mapping[Record] =
     new Mapping[Record] {
       def observe(firebase: Firebase) = {
-        val field1Observable = field(field1).observe(firebase)
+        val field1Observable = fieldMapping(field1).observe(firebase)
         convertToRecord(field1Observable, firebase)(makeRecord)
       }
       def set(firebase: Firebase, record: Record) = {
-        field(field1).set(firebase, field1.get(record).value)
+        setField(field1, record, firebase)
       }
     }
 
-  def record2[Field1, Field2, Record](makeRecord: (Remote[Field1], Remote[Field2]) => Record)(
+  def record[Field1, Field2, Record](makeRecord: (Stored[Field1], Stored[Field2]) => Record)(
     field1: Field[Field1, Record],
     field2: Field[Field2, Record]
   ): Mapping[Record] =
     new Mapping[Record] {
       def observe(firebase: Firebase) = {
-        val field1Observable = field(field1).observe(firebase)
-        val field2Observable = field(field2).observe(firebase)
+        val field1Observable = fieldMapping(field1).observe(firebase)
+        val field2Observable = fieldMapping(field2).observe(firebase)
         val fieldsObservable = field1Observable.combineLatest(field2Observable)
         convertToRecord(fieldsObservable, firebase)(makeRecord.tupled)
       }
       def set(firebase: Firebase, record: Record) = {
         parallel(
-          field(field1).set(firebase, field1.get(record).value),
-          field(field2).set(firebase, field2.get(record).value)
+          setField(field1, record, firebase),
+          setField(field2, record, firebase)
         )
       }
     }
@@ -189,16 +209,16 @@ object Mapping {
   private def parallel(futures: Future[Unit]*): Future[Unit] =
     Future.traverse(futures)(identity).map(_ => ())
 
-  def record3[Field1, Field2, Field3, Record](makeRecord: (Remote[Field1], Remote[Field2], Remote[Field3]) => Record)(
+  def record[Field1, Field2, Field3, Record](makeRecord: (Stored[Field1], Stored[Field2], Stored[Field3]) => Record)(
     field1: Field[Field1, Record],
     field2: Field[Field2, Record],
     field3: Field[Field3, Record]
   ): Mapping[Record] =
     new Mapping[Record] {
       def observe(firebase: Firebase) = {
-        val field1Observable = field(field1).observe(firebase)
-        val field2Observable = field(field2).observe(firebase)
-        val field3Observable = field(field3).observe(firebase)
+        val field1Observable = fieldMapping(field1).observe(firebase)
+        val field2Observable = fieldMapping(field2).observe(firebase)
+        val field3Observable = fieldMapping(field3).observe(firebase)
         val fieldsObservable =
           field1Observable
             .combineLatest(field2Observable)
@@ -208,14 +228,14 @@ object Mapping {
       }
       def set(firebase: Firebase, record: Record) = {
         parallel(
-          field(field1).set(firebase, field1.get(record).value),
-          field(field2).set(firebase, field2.get(record).value),
-          field(field3).set(firebase, field3.get(record).value)
+          setField(field1, record, firebase),
+          setField(field2, record, firebase),
+          setField(field3, record, firebase)
         )
       }
     }
 
-  def record4[Field1, Field2, Field3, Field4, Record](makeRecord: (Remote[Field1], Remote[Field2], Remote[Field3], Remote[Field4]) => Record)(
+  def record[Field1, Field2, Field3, Field4, Record](makeRecord: (Stored[Field1], Stored[Field2], Stored[Field3], Stored[Field4]) => Record)(
     field1: Field[Field1, Record],
     field2: Field[Field2, Record],
     field3: Field[Field3, Record],
@@ -223,10 +243,10 @@ object Mapping {
   ): Mapping[Record] =
     new Mapping[Record] {
       def observe(firebase: Firebase) = {
-        val field1Observable = field(field1).observe(firebase)
-        val field2Observable = field(field2).observe(firebase)
-        val field3Observable = field(field3).observe(firebase)
-        val field4Observable = field(field4).observe(firebase)
+        val field1Observable = fieldMapping(field1).observe(firebase)
+        val field2Observable = fieldMapping(field2).observe(firebase)
+        val field3Observable = fieldMapping(field3).observe(firebase)
+        val field4Observable = fieldMapping(field4).observe(firebase)
         val fieldsObservable =
           field1Observable
             .combineLatest(field2Observable)
@@ -237,15 +257,15 @@ object Mapping {
       }
       def set(firebase: Firebase, record: Record) = {
         parallel(
-          field(field1).set(firebase, field1.get(record).value),
-          field(field2).set(firebase, field2.get(record).value),
-          field(field3).set(firebase, field3.get(record).value),
-          field(field4).set(firebase, field4.get(record).value)
+          setField(field1, record, firebase),
+          setField(field2, record, firebase),
+          setField(field3, record, firebase),
+          setField(field4, record, firebase)
         )
       }
     }
 
-  def choice2[Alternative1 <: Choice : ClassTag, Alternative2 <: Choice : ClassTag, Choice](
+  def choice[Alternative1 <: Choice : ClassTag, Alternative2 <: Choice : ClassTag, Choice](
     alternative1: Alternative[Alternative1],
     alternative2: Alternative[Alternative2]
   ): Mapping[Choice] =
@@ -254,8 +274,9 @@ object Mapping {
         val typeNameObservable = string.observe(typeNameChild(firebase))
         typeNameObservable.switchMap(remoteTypeName => {
           remoteTypeName.value match {
-            case alternative1.typeName => alternativeObserve(alternative1, firebase)
-            case alternative2.typeName => alternativeObserve(alternative2, firebase)
+            case Right(alternative1.typeName) => alternativeObserve(alternative1, firebase)
+            case Right(alternative2.typeName) => alternativeObserve(alternative2, firebase)
+            case Left(error) => Observable(Remote(firebase, Left(error)))
             case _ => Observable.empty
           }
         })
@@ -273,7 +294,7 @@ object Mapping {
   private def alternativeObserve[T](alternative: Alternative[T], firebase: Firebase) =
     alternative.getMapping().observe(valueChild(firebase))
 
-  def choice3[Alternative1 <: Choice : ClassTag, Alternative2 <: Choice : ClassTag, Alternative3 <: Choice : ClassTag, Choice](
+  def choice[Alternative1 <: Choice : ClassTag, Alternative2 <: Choice : ClassTag, Alternative3 <: Choice : ClassTag, Choice](
     alternative1: Alternative[Alternative1],
     alternative2: Alternative[Alternative2],
     alternative3: Alternative[Alternative3]
@@ -283,9 +304,10 @@ object Mapping {
         val typeNameObservable = string.observe(typeNameChild(firebase))
         typeNameObservable.switchMap(remoteTypeName => {
           remoteTypeName.value match {
-            case alternative1.typeName => alternativeObserve(alternative1, firebase)
-            case alternative2.typeName => alternativeObserve(alternative2, firebase)
-            case alternative3.typeName => alternativeObserve(alternative3, firebase)
+            case Right(alternative1.typeName) => alternativeObserve(alternative1, firebase)
+            case Right(alternative2.typeName) => alternativeObserve(alternative2, firebase)
+            case Right(alternative3.typeName) => alternativeObserve(alternative3, firebase)
+            case Left(error) => Observable(Remote(firebase, Left(error)))
             case _ => Observable.empty
           }
         })
@@ -301,7 +323,7 @@ object Mapping {
       }
     }
 
-  def choice4[Alternative1 <: Choice : ClassTag, Alternative2 <: Choice : ClassTag, Alternative3 <: Choice : ClassTag, Alternative4 <: Choice : ClassTag, Choice](
+  def choice[Alternative1 <: Choice : ClassTag, Alternative2 <: Choice : ClassTag, Alternative3 <: Choice : ClassTag, Alternative4 <: Choice : ClassTag, Choice](
     alternative1: Alternative[Alternative1],
     alternative2: Alternative[Alternative2],
     alternative3: Alternative[Alternative3],
@@ -312,10 +334,11 @@ object Mapping {
         val typeNameObservable = string.observe(typeNameChild(firebase))
         typeNameObservable.switchMap(remoteTypeName => {
           remoteTypeName.value match {
-            case alternative1.typeName => alternativeObserve(alternative1, firebase)
-            case alternative2.typeName => alternativeObserve(alternative2, firebase)
-            case alternative3.typeName => alternativeObserve(alternative3, firebase)
-            case alternative4.typeName => alternativeObserve(alternative4, firebase)
+            case Right(alternative1.typeName) => alternativeObserve(alternative1, firebase)
+            case Right(alternative2.typeName) => alternativeObserve(alternative2, firebase)
+            case Right(alternative3.typeName) => alternativeObserve(alternative3, firebase)
+            case Right(alternative4.typeName) => alternativeObserve(alternative4, firebase)
+            case Left(error) => Observable(Remote(firebase, Left(error)))
             case _ => Observable.empty
           }
         })
@@ -347,7 +370,7 @@ object Mapping {
     )
 
   type Many[+T] =
-    List[Remote[T]]
+    List[Stored[T]]
 
   def list[T](elementMapping: Mapping[T]): Mapping[Many[T]] =
     new Mapping[Many[T]] {
@@ -358,18 +381,20 @@ object Mapping {
           val updatesByChild = children.map(child =>
             elementMapping.observe(child).map(elementValue => (child.toString, elementValue))
           )
-          val elementsByChild = Observable.merge(updatesByChild:_*).scan(Map[String, Remote[T]]())(_ + _)
+          val elementsByChild = Observable.merge(updatesByChild:_*).scan(Map[String, Stored[T]]())(_ + _)
           elementsByChild.map(elementMap =>
-            Remote(firebase, elementMap.toList.sortBy(entry => entry._1).map(entry => entry._2))
+            Remote(firebase, Right(elementMap.toList.sortBy(entry => entry._1).map(entry => entry._2)))
           )
         })
       }
 
       def set(firebase: Firebase, elements: Many[T]) = {
         firebase.remove()
-        val futures = elements.map(element => {
-          elementMapping.set(element.firebase, element.value)
-        })
+        val futures = elements.map(element =>
+          element.value.right.toOption
+            .map(value => elementMapping.set(element.firebase, value))
+            .getOrElse(Future())
+        )
         parallel(futures:_*)
       }
     }
