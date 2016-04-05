@@ -292,7 +292,9 @@ object Mapping {
     }
 
   private def alternativeObserve[T](alternative: Alternative[T], firebase: Firebase) =
-    alternative.getMapping().observe(valueChild(firebase))
+    alternative.getMapping().observe(valueChild(firebase)).map(stored => {
+      Remote(firebase, stored.value) // trace the original Firebase since mapping.set works for it correctly
+    })
 
   def choice[Alternative1 <: Choice : ClassTag, Alternative2 <: Choice : ClassTag, Alternative3 <: Choice : ClassTag, Choice](
     alternative1: Alternative[Alternative1],
