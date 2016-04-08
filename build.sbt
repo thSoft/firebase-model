@@ -9,7 +9,7 @@ version := "0.0.0"
 
 organization := "hu.thsoft"
 
-scalaVersion := "2.11.7"
+scalaVersion := "2.11.8"
 
 libraryDependencies ++= Seq(
   "hu.thsoft" %%% "firebase-scalajs" % "2.4.1",
