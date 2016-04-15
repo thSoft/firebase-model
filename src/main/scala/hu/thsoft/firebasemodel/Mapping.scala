@@ -361,7 +361,7 @@ object Mapping {
     firebase.child("type")
   }
 
-  private def valueChild(firebase: Firebase) = {
+  def valueChild(firebase: Firebase) = {
     firebase.child("value")
   }
 
