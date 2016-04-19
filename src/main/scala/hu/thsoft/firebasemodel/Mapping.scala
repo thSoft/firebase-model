@@ -24,6 +24,10 @@ import Mapping.Stored
 trait Mapping[T] {
   def observe(firebase: Firebase): Observable[Stored[T]]
   def set(firebase: Firebase, value: T): Future[Unit]
+  def push(parent: Firebase, value: T): Future[Stored[T]] = {
+    val child = parent.push(null)
+    set(child, value).map(_ => Remote(child, Right(value)))
+  }
 }
 
 case class Remote[+T](
