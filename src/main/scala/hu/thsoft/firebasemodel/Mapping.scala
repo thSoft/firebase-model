@@ -118,10 +118,14 @@ object Mapping {
           val snapshotValue = snapshot.`val`
           val json = upickle.json.readJs(snapshotValue)
           val value =
-            try {
-              Right(readJson(json))
-            } catch {
-              case e: Throwable => Left(Invalid(json, typeName, e))
+            json match {
+              case Js.Null => Left(Invalid(null, typeName, new NullPointerException))
+              case _ =>
+                try {
+                  Right(readJson(json))
+                } catch {
+                  case e: Throwable => Left(Invalid(json, typeName, e))
+                }
             }
           Remote(firebase, value)
         })
