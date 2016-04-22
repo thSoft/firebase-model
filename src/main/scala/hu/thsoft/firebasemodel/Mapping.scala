@@ -390,8 +390,12 @@ object Mapping {
           val updatesByChild = children.map(child =>
             elementMapping.observe(child).map(elementValue => (child.toString, elementValue))
           )
-          val elementsByChild = Observable.merge(updatesByChild:_*)
-            .scan(Map[String, Stored[T]]())(_ + _)
+          val elementsByChild =
+            if (updatesByChild.isEmpty) {
+              Observable.pure(Map[String, Stored[T]]())
+            } else {
+              Observable.merge(updatesByChild:_*).scan(Map[String, Stored[T]]())(_ + _)
+            }
           elementsByChild.map(elementMap =>
             Remote(firebase, Right(elementMap.toList.sortBy(entry => entry._1).map(entry => entry._2)))
           )
