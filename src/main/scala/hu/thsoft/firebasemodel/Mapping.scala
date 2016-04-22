@@ -3,23 +3,23 @@ package hu.thsoft.firebasemodel
 import scala.scalajs.js
 import hu.thsoft.firebase.Firebase
 import hu.thsoft.firebase.FirebaseDataSnapshot
-import monifu.concurrent.Implicits
-import monifu.concurrent.cancelables.BooleanCancelable
-import monifu.reactive.Observable
-import monifu.reactive.OverflowStrategy
-import monifu.reactive.channels.PublishChannel
-import monifu.reactive.observables.ConnectableObservable
 import upickle.Js
 import upickle.default.StringRW
 import upickle.default.readJs
 import upickle.default.writeJs
-import monifu.reactive.Subscriber
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.Future
 import scala.scalajs.js.Thenable.Implicits.thenable2future
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.reflect.ClassTag
 import Mapping.Stored
+import monix.reactive.Observable
+import monix.reactive.observables.ConnectableObservable
+import monix.execution.cancelables.BooleanCancelable
+import monix.reactive.observers.Subscriber
+import monix.reactive.OverflowStrategy
+import monix.execution.Scheduler
+import monix.reactive.subjects.PublishSubject
 
 trait Mapping[T] {
   def observe(firebase: Firebase): Observable[Stored[T]]
@@ -57,34 +57,34 @@ object Mapping {
   def observeRaw(firebase: Firebase): Observable[FirebaseDataSnapshot] =
     new ConnectableObservable[FirebaseDataSnapshot] {
 
-      private val channel = PublishChannel[FirebaseDataSnapshot](OverflowStrategy.Unbounded)(monifu.concurrent.Implicits.globalScheduler)
+      private val channel = PublishSubject[FirebaseDataSnapshot]
 
       private lazy val subscription = {
         val eventType = "value"
         val callback =
           (snapshot: FirebaseDataSnapshot, previousKey: js.UndefOr[String]) => {
-            channel.pushNext(snapshot)
+            channel.onNext(snapshot)
             ()
           }
         val cancelCallback =
           (cancellation: js.Any) => {
-            channel.pushError(Cancellation(cancellation))
+            channel.onError(Cancellation(cancellation))
           }
         try {
           firebase.on(eventType, callback, cancelCallback)
         } catch {
-          case e: Throwable => channel.pushError(e)
+          case e: Throwable => channel.onError(e)
         }
-        BooleanCancelable {
-          channel.pushComplete()
+        BooleanCancelable(() => {
+          channel.onComplete()
           firebase.off(eventType, callback)
-        }
+        })
       }
 
       override def connect() = subscription
 
-      override def onSubscribe(subscriber: Subscriber[FirebaseDataSnapshot]): Unit = {
-        channel.onSubscribe(subscriber)
+      override def unsafeSubscribeFn(subscriber: Subscriber[FirebaseDataSnapshot]) = {
+        channel.unsafeSubscribeFn(subscriber)
       }
 
     }.refCount
@@ -92,7 +92,7 @@ object Mapping {
   def always[T](value: T): Mapping[T] =
     new Mapping[T] {
       def observe(firebase: Firebase) = {
-        Observable(Remote(firebase, Right(value)))
+        Observable.pure(Remote(firebase, Right(value)))
       }
       def set(firebase: Firebase, value: T) = {
         Future(())
@@ -153,12 +153,11 @@ object Mapping {
         val urlObservable = string.observe(firebase)
         urlObservable.switchMap(remoteUrl =>
           remoteUrl.value match {
-            case Left(error) => Observable(Remote(firebase, Left(error)))
+            case Left(error) => Observable.pure(Remote(firebase, Left(error)))
             case Right(url) =>
               mapping.observe(new Firebase(url))
                 .map(value => Remote(firebase, Right(value)))
           }
-
         )
       }
       def set(firebase: Firebase, reference: Stored[T]) = {
@@ -284,7 +283,7 @@ object Mapping {
           remoteTypeName.value match {
             case Right(alternative1.typeName) => alternativeObserve(alternative1, firebase)
             case Right(alternative2.typeName) => alternativeObserve(alternative2, firebase)
-            case Left(error) => Observable(Remote(firebase, Left(error)))
+            case Left(error) => Observable.pure(Remote(firebase, Left(error)))
             case _ => Observable.empty
           }
         })
@@ -317,7 +316,7 @@ object Mapping {
             case Right(alternative1.typeName) => alternativeObserve(alternative1, firebase)
             case Right(alternative2.typeName) => alternativeObserve(alternative2, firebase)
             case Right(alternative3.typeName) => alternativeObserve(alternative3, firebase)
-            case Left(error) => Observable(Remote(firebase, Left(error)))
+            case Left(error) => Observable.pure(Remote(firebase, Left(error)))
             case _ => Observable.empty
           }
         })
@@ -348,7 +347,7 @@ object Mapping {
             case Right(alternative2.typeName) => alternativeObserve(alternative2, firebase)
             case Right(alternative3.typeName) => alternativeObserve(alternative3, firebase)
             case Right(alternative4.typeName) => alternativeObserve(alternative4, firebase)
-            case Left(error) => Observable(Remote(firebase, Left(error)))
+            case Left(error) => Observable.pure(Remote(firebase, Left(error)))
             case _ => Observable.empty
           }
         })
@@ -391,7 +390,8 @@ object Mapping {
           val updatesByChild = children.map(child =>
             elementMapping.observe(child).map(elementValue => (child.toString, elementValue))
           )
-          val elementsByChild = Observable.merge(updatesByChild:_*).scan(Map[String, Stored[T]]())(_ + _)
+          val elementsByChild = Observable.merge(updatesByChild:_*)
+            .scan(Map[String, Stored[T]]())(_ + _)
           elementsByChild.map(elementMap =>
             Remote(firebase, Right(elementMap.toList.sortBy(entry => entry._1).map(entry => entry._2)))
           )

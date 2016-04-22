@@ -13,7 +13,7 @@ scalaVersion := "2.11.8"
 
 libraryDependencies ++= Seq(
   "hu.thsoft" %%% "firebase-scalajs" % "2.4.1",
-  "org.monifu" %%% "monifu" % "1.1",
+  "io.monix" %%% "monix" % "2.0-M2",
   "com.lihaoyi" %%% "upickle" % "0.3.8"
 )
 
