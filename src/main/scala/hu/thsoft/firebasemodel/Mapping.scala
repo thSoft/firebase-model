@@ -51,13 +51,12 @@ case class Alternative[AlternativeValue](
 
 object Mapping {
 
-  def observeRaw(firebase: Firebase): Observable[FirebaseDataSnapshot] =
+  def observeRaw(firebase: Firebase, eventType: String = "value"): Observable[FirebaseDataSnapshot] =
     new ConnectableObservable[FirebaseDataSnapshot] {
 
       private val channel = PublishSubject[FirebaseDataSnapshot]
 
       private lazy val subscription = {
-        val eventType = "value"
         val callback =
           (snapshot: FirebaseDataSnapshot, previousKey: js.UndefOr[String]) => {
             channel.onNext(snapshot)
@@ -371,7 +370,7 @@ object Mapping {
     firebase.child("type")
   }
 
-  private def valueChild(firebase: Firebase) = {
+  def valueChild(firebase: Firebase) = { // XXX make private?
     firebase.child("value")
   }
 
